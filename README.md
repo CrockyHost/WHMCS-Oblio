@@ -66,7 +66,7 @@ Released under GPL v3: free forever, must remain readable source, modifications 
    - Company CIF (your VAT number in Oblio)
    - Invoice Series name
    - CUI/CIF custom client field (which WHMCS custom field stores the client's tax number)
-   - Default VAT % (e.g., 19 for Romania, or 0 if you are not VAT-registered)
+   - Default VAT % (e.g., 21 for Romania, or 0 if you are not VAT-registered)
    - Zero-Rate VAT Name (must match one of your 0% rates in Oblio - default `Scutita`)
    - Toggle the sync features you want enabled
 

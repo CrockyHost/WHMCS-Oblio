@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 - Default VAT bumped to Romania's 21% (2026-05-11)
+
+- Changed default `Default VAT %` setting from 19 to 21 to match Romania's current standard VAT rate. Existing installations are unaffected (the saved per-install value is preserved); only fresh activations and the unset fallback see the new default.
+- Updated README example accordingly.
+
 ## 1.3.0 - Initial public release (2026-05-11)
 
 First open-source release. The addon was developed and battle-tested in production at CrockyHost before being extracted and published.

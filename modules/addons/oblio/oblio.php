@@ -45,7 +45,7 @@ function oblio_config()
     return [
         'name'        => 'Oblio Integration',
         'description' => 'Integrates WHMCS with Oblio.eu for automated invoice creation and payment collection (Incasare). Supports Romanian e-Factura regulations.',
-        'version'     => '1.3.0',
+        'version'     => '1.3.1',
         'author'      => '<a href="https://crocky.host" target="_blank" rel="noopener">CROCKY SRL</a>',
         'language'    => 'english',
         'fields'      => [
@@ -132,8 +132,8 @@ function oblio_config()
                 'FriendlyName' => 'Default VAT %',
                 'Type'         => 'text',
                 'Size'         => '5',
-                'Default'      => '19',
-                'Description'  => 'Default VAT percentage for taxed line items (e.g., 19 for Romania). Set to 0 if you (the issuer) are not VAT-registered - all items will be sent at 0% with the Zero-Rate VAT Name below.',
+                'Default'      => '21',
+                'Description'  => 'Default VAT percentage for taxed line items (e.g., 21 for Romania). Set to 0 if you (the issuer) are not VAT-registered - all items will be sent at 0% with the Zero-Rate VAT Name below.',
             ],
             'vat_exempt_name' => [
                 'FriendlyName' => 'Zero-Rate VAT Name',
@@ -643,7 +643,7 @@ function oblio_manual_sync($invoiceId, $docType, $vars)
             return ['success' => false, 'message' => 'Invoice series not configured.'];
         }
 
-        $vatPercentage = !empty($vars['vat_percentage']) ? (int)$vars['vat_percentage'] : 19;
+        $vatPercentage = !empty($vars['vat_percentage']) ? (int)$vars['vat_percentage'] : 21;
         $vatExemptName = !empty($vars['vat_exempt_name']) ? $vars['vat_exempt_name'] : 'Scutita';
 
         $payload = WhmcsHelper::buildDocumentPayload(

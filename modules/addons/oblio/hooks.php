@@ -99,7 +99,7 @@ function oblio_send_document($invoiceId, $docType, array $settings)
             return;
         }
 
-        $vatPercentage = !empty($settings['vat_percentage']) ? (int)$settings['vat_percentage'] : 19;
+        $vatPercentage = !empty($settings['vat_percentage']) ? (int)$settings['vat_percentage'] : 21;
         $vatExemptName = !empty($settings['vat_exempt_name']) ? $settings['vat_exempt_name'] : 'Scutita';
 
         $payload = WhmcsHelper::buildDocumentPayload(
