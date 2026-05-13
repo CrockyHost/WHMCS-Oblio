@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.2 - Auto-recover from Oblio duplicate-product-name 400 (2026-05-13)
+
+- When Oblio rejects invoice creation with "are cu aceeasi Denumire si Tip exista deja in baza de date. Oblio nu permite Denumiri duplicate", the addon now retries the same payload once with ` #INV-{whmcs_invoice_id}` appended to every line item name to force uniqueness. Clean descriptions stay clean for invoices that don't collide; the suffix only appears on the Oblio side when the collision actually occurred. Oblio's API does not expose a DELETE on `/api/nomenclature/products`, so this retry-with-suffix is the only path that doesn't require touching the Oblio web UI.
+- The retry is logged to the WHMCS activity log so suffixed invoices can be located after the fact.
+
 ## 1.3.1 - Default VAT bumped to Romania's 21% (2026-05-11)
 
 - Changed default `Default VAT %` setting from 19 to 21 to match Romania's current standard VAT rate. Existing installations are unaffected (the saved per-install value is preserved); only fresh activations and the unset fallback see the new default.

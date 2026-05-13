@@ -45,7 +45,7 @@ function oblio_config()
     return [
         'name'        => 'Oblio Integration',
         'description' => 'Integrates WHMCS with Oblio.eu for automated invoice creation and payment collection (Incasare). Supports Romanian e-Factura regulations.',
-        'version'     => '1.3.1',
+        'version'     => '1.3.2',
         'author'      => '<a href="https://crocky.host" target="_blank" rel="noopener">CROCKY SRL</a>',
         'language'    => 'english',
         'fields'      => [

@@ -70,6 +70,54 @@ function oblio_try_send_spv($api, array $settings, $invoiceId, $oblioSeries, $ob
 }
 
 /**
+ * Call Oblio createDocument, retrying once with a uniqueness suffix on every
+ * line item if Oblio rejects with a duplicate-product-name error.
+ *
+ * Oblio adds each line item to its product nomenclator (keyed by Denumire +
+ * Tip) and refuses to issue a document if a row with the same name already
+ * exists. The API exposes no DELETE on /api/nomenclature/products, so the only
+ * way to recover is to make the names unique on retry by appending the WHMCS
+ * invoice ID. Clean descriptions stay clean for non-colliding invoices.
+ */
+function oblio_create_document_with_dedup_retry($api, $docType, array $payload, $invoiceId)
+{
+    try {
+        return $api->createDocument($docType, $payload);
+    } catch (\Exception $e) {
+        if (!oblio_is_duplicate_name_error($e->getMessage())) {
+            throw $e;
+        }
+
+        $suffix = ' #INV-' . $invoiceId;
+        if (!empty($payload['products']) && is_array($payload['products'])) {
+            foreach ($payload['products'] as $i => $product) {
+                if (isset($product['name']) && strpos($product['name'], $suffix) === false) {
+                    $payload['products'][$i]['name'] = $product['name'] . $suffix;
+                }
+            }
+        }
+
+        logActivity('Oblio: Duplicate product name on invoice #' . $invoiceId . '. Retrying with unique suffix.');
+        return $api->createDocument($docType, $payload);
+    }
+}
+
+/**
+ * Detect Oblio's duplicate-product-name 400 from its (Romanian) error message.
+ */
+function oblio_is_duplicate_name_error($message)
+{
+    $message = (string)$message;
+    if (stripos($message, 'Denumiri duplicate') !== false) {
+        return true;
+    }
+    if (stripos($message, 'aceeasi Denumire') !== false && stripos($message, 'exista deja') !== false) {
+        return true;
+    }
+    return false;
+}
+
+/**
  * Send a document to Oblio.
  *
  * @param int    $invoiceId WHMCS invoice ID
@@ -113,7 +161,7 @@ function oblio_send_document($invoiceId, $docType, array $settings)
         );
 
         $api = new OblioApi($settings['api_email'], $settings['api_secret']);
-        $response = $api->createDocument($docType, $payload);
+        $response = oblio_create_document_with_dedup_retry($api, $docType, $payload, $invoiceId);
 
         $oblioSeries = isset($response['data']['seriesName']) ? $response['data']['seriesName'] : $seriesName;
         $oblioNumber = isset($response['data']['number']) ? $response['data']['number'] : '';
