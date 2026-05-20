@@ -176,63 +176,63 @@ function oblio_send_document($invoiceId, $docType, array $settings)
 }
 
 /**
- * Record payment (Incasare) on an already-created Oblio invoice.
+ * Record one Incasare on Oblio for a specific WHMCS transaction.
  *
- * Looks up the Oblio invoice that was created when the WHMCS invoice was generated,
- * then calls the collect endpoint with the payment details from the WHMCS transaction.
+ * One Oblio Incasare = one WHMCS tblaccounts row. Multiple partial payments on the same
+ * invoice produce multiple Incasari, each tracked by transaction_id in mod_oblio_invoices.
+ * SPV is intentionally not fired here - InvoicePaid handles that once per Paid-status
+ * transition so partial-payment invoices don't fire SPV repeatedly.
  *
- * @param int   $invoiceId WHMCS invoice ID
- * @param array $settings  Module settings
+ * @param int   $invoiceId   WHMCS invoice ID
+ * @param array $transaction WHMCS transaction row (id, transid, gateway, amountin, date)
+ * @param array $settings    Module settings
+ * @return bool true if Incasare was sent (or already existed), false on configuration/error
  */
-function oblio_collect_document($invoiceId, array $settings)
+function oblio_collect_document($invoiceId, array $transaction, array $settings)
 {
+    $transactionId = (int)($transaction['id'] ?? 0);
+
     try {
         if (empty($settings['api_email']) || empty($settings['api_secret'])) {
             logActivity('Oblio: API credentials not configured. Skipping Incasare for invoice #' . $invoiceId);
-            return;
+            return false;
         }
         if (empty($settings['company_cif'])) {
             logActivity('Oblio: Company CIF not configured. Skipping Incasare for invoice #' . $invoiceId);
-            return;
+            return false;
+        }
+        if ($transactionId === 0) {
+            logActivity('Oblio: Cannot record Incasare without a transaction id for invoice #' . $invoiceId);
+            return false;
         }
 
         $syncedInvoice = WhmcsHelper::getSyncedInvoice($invoiceId);
         if (!$syncedInvoice) {
-            logActivity('Oblio: No synced invoice found for WHMCS invoice #' . $invoiceId . '. Cannot add Incasare.');
-            return;
+            logActivity('Oblio: No synced invoice found for WHMCS invoice #' . $invoiceId . '. Cannot add Incasare for transaction #' . $transactionId . '.');
+            return false;
         }
 
-        if (WhmcsHelper::isSynced($invoiceId, 'collect')) {
-            logActivity('Oblio: Incasare already recorded for invoice #' . $invoiceId . '. Skipping. (To re-collect, delete the payment in WHMCS and re-add it - InvoiceUnpaid will clear this state.)');
-            return;
+        if (WhmcsHelper::isTransactionSynced($invoiceId, $transactionId)) {
+            logActivity('Oblio: Transaction #' . $transactionId . ' already collected for invoice #' . $invoiceId . '. Skipping.');
+            return true;
         }
 
         $defaultCollectType = !empty($settings['collect_type']) ? $settings['collect_type'] : 'Ordin de plata';
 
         $collect = [
-            'type'           => $defaultCollectType,
-            'issueDate'      => date('Y-m-d'),
-            'documentNumber' => 'WHMCS-' . $invoiceId,
-        ];
-
-        // Use actual transaction details where available
-        $transaction = WhmcsHelper::getLastTransaction($invoiceId);
-        if ($transaction) {
-            $collect['type'] = WhmcsHelper::mapGatewayToCollectType(
-                $transaction['gateway'],
+            'type'           => WhmcsHelper::mapGatewayToCollectType(
+                $transaction['gateway'] ?? '',
                 $defaultCollectType
-            );
-            if (!empty($transaction['amountin']) && (float)$transaction['amountin'] > 0) {
-                $collect['value'] = round((float)$transaction['amountin'], 2);
-            }
-            if (!empty($transaction['date'])) {
-                $collect['issueDate'] = date('Y-m-d', strtotime($transaction['date']));
-            }
-            if (!empty($transaction['transid'])) {
-                $collect['documentNumber'] = $transaction['transid'];
-            } elseif (!empty($transaction['id'])) {
-                $collect['documentNumber'] = (string)$transaction['id'];
-            }
+            ),
+            'issueDate'      => !empty($transaction['date'])
+                ? date('Y-m-d', strtotime($transaction['date']))
+                : date('Y-m-d'),
+            'documentNumber' => !empty($transaction['transid'])
+                ? $transaction['transid']
+                : (string)$transactionId,
+        ];
+        if (!empty($transaction['amountin']) && (float)$transaction['amountin'] > 0) {
+            $collect['value'] = round((float)$transaction['amountin'], 2);
         }
 
         $api = new OblioApi($settings['api_email'], $settings['api_secret']);
@@ -243,18 +243,52 @@ function oblio_collect_document($invoiceId, array $settings)
             $collect
         );
 
-        WhmcsHelper::logSync($invoiceId, 'collect', $syncedInvoice->oblio_series, $syncedInvoice->oblio_number, 'success', $collect['type']);
-        logActivity('Oblio: Incasare (' . $collect['type'] . ') added for invoice #' . $invoiceId . ': ' . $syncedInvoice->oblio_series . ' #' . $syncedInvoice->oblio_number);
+        WhmcsHelper::logSync(
+            $invoiceId,
+            'collect',
+            $syncedInvoice->oblio_series,
+            $syncedInvoice->oblio_number,
+            'success',
+            $collect['type'] . ' / value=' . ($collect['value'] ?? 'auto'),
+            $transactionId
+        );
+        logActivity('Oblio: Incasare (' . $collect['type'] . ') added for invoice #' . $invoiceId
+            . ' txn #' . $transactionId . ': ' . $syncedInvoice->oblio_series . ' #' . $syncedInvoice->oblio_number);
 
-        // SPV is sent after payment is confirmed, not at invoice creation
-        oblio_try_send_spv($api, $settings, $invoiceId, $syncedInvoice->oblio_series, $syncedInvoice->oblio_number);
+        return true;
 
     } catch (\Exception $e) {
         $series = isset($syncedInvoice) ? $syncedInvoice->oblio_series : '';
         $number = isset($syncedInvoice) ? $syncedInvoice->oblio_number : '';
-        WhmcsHelper::logSync($invoiceId, 'collect', $series, $number, 'error', $e->getMessage());
-        logActivity('Oblio: Failed to add Incasare for invoice #' . $invoiceId . ': ' . $e->getMessage());
+        WhmcsHelper::logSync($invoiceId, 'collect', $series, $number, 'error', $e->getMessage(), $transactionId);
+        logActivity('Oblio: Failed to add Incasare for invoice #' . $invoiceId . ' txn #' . $transactionId . ': ' . $e->getMessage());
+        return false;
     }
+}
+
+/**
+ * Collect every not-yet-collected positive transaction on an invoice.
+ *
+ * Used by InvoicePaid and the admin Manual Sync UI. Idempotent: re-running it after
+ * any number of payments only sends Incasari for transactions that don't already
+ * have a successful collect row.
+ *
+ * @return int Number of new Incasari sent
+ */
+function oblio_collect_all_transactions($invoiceId, array $settings)
+{
+    $transactions = WhmcsHelper::getTransactions($invoiceId);
+    $sent = 0;
+    foreach ($transactions as $t) {
+        $tid = (int)($t['id'] ?? 0);
+        if ($tid === 0 || WhmcsHelper::isTransactionSynced($invoiceId, $tid)) {
+            continue;
+        }
+        if (oblio_collect_document($invoiceId, $t, $settings)) {
+            $sent++;
+        }
+    }
+    return $sent;
 }
 
 /**
@@ -316,9 +350,10 @@ add_hook('InvoiceCreationPreEmail', 1, function ($vars) {
 /**
  * Hook: InvoicePaid
  *
- * Triggered when an invoice is paid in WHMCS.
+ * Triggered when an invoice's status flips to Paid in WHMCS (last payment posted).
  * Ensures the invoice exists in Oblio (creates it if it was missed at generation),
- * then records the payment via Incasare.
+ * collects every transaction that doesn't already have an Incasare in Oblio, then
+ * fires SPV once if enabled.
  */
 add_hook('InvoicePaid', 1, function ($vars) {
     $invoiceId = $vars['invoiceid'];
@@ -342,48 +377,39 @@ add_hook('InvoicePaid', 1, function ($vars) {
     }
 
     if ($collectOn) {
-        oblio_collect_document($invoiceId, $settings);
+        $sent = oblio_collect_all_transactions($invoiceId, $settings);
+        if ($sent > 0) {
+            logActivity('Oblio: InvoicePaid #' . $invoiceId . ' - sent ' . $sent . ' new Incasare(s).');
+        }
     } else {
         logActivity('Oblio: InvoicePaid #' . $invoiceId . ' - Incasare disabled in module settings; not collecting.');
     }
-});
 
-/**
- * Hook: InvoiceUnpaid
- *
- * When an admin deletes a payment in WHMCS, the invoice transitions back to Unpaid.
- * Clear our 'collect' sync row so the next AddPayment will trigger a fresh Incasare
- * instead of being blocked by isSynced().
- */
-add_hook('InvoiceUnpaid', 1, function ($vars) {
-    $invoiceId = $vars['invoiceid'];
-    try {
-        if (class_exists('\\WHMCS\\Database\\Capsule')) {
-            $deleted = \WHMCS\Database\Capsule::table('mod_oblio_invoices')
-                ->where('invoice_id', $invoiceId)
-                ->where('oblio_type', 'collect')
-                ->delete();
-            if ($deleted) {
-                logActivity('Oblio: InvoiceUnpaid #' . $invoiceId . ' - cleared ' . $deleted . ' collect sync row(s); next payment will re-trigger Incasare.');
+    // SPV submission: fire once now that the invoice is fully Paid. Inside the helper
+    // it bails if enable_spv is off; this hook only runs on the Paid-status transition
+    // so we don't risk re-submitting on every partial-payment Incasare.
+    if (!empty($settings['enable_spv']) && $settings['enable_spv'] === 'on'
+        && !empty($settings['api_email']) && !empty($settings['api_secret'])
+    ) {
+        $synced = WhmcsHelper::getSyncedInvoice($invoiceId);
+        if ($synced) {
+            try {
+                $api = new OblioApi($settings['api_email'], $settings['api_secret']);
+                oblio_try_send_spv($api, $settings, $invoiceId, $synced->oblio_series, $synced->oblio_number);
+            } catch (\Exception $e) {
+                logActivity('Oblio: InvoicePaid #' . $invoiceId . ' - SPV submission failed: ' . $e->getMessage());
             }
         }
-    } catch (\Exception $e) {
-        logActivity('Oblio: InvoiceUnpaid #' . $invoiceId . ' - failed to clear collect state: ' . $e->getMessage());
     }
 });
 
 /**
  * Hook: AddTransaction
  *
- * Safety net for the case where an admin deletes and re-adds a payment in WHMCS:
- * deleting a transaction does NOT revert the invoice status from Paid to Unpaid
- * (datepaid stays set), so the subsequent AddTransaction does NOT re-fire InvoicePaid.
- * Without this hook, the re-add would silently do nothing in Oblio.
- *
- * This hook fires for every transaction added. We attempt the Incasare if:
- *   - The transaction has a positive amountin (it's an incoming payment)
- *   - It's tied to an invoice
- *   - That invoice is currently Paid
+ * Fires when ANY transaction is added in WHMCS - including partial payments that
+ * leave the invoice Unpaid. We send one Incasare for this specific transaction.
+ * isTransactionSynced() inside oblio_collect_document() blocks duplicates if the
+ * same transaction ever fires twice (e.g. AddTransaction + a manual sync race).
  */
 add_hook('AddTransaction', 1, function ($vars) {
     if (empty($vars['invoiceid'])) {
@@ -396,32 +422,28 @@ add_hook('AddTransaction', 1, function ($vars) {
     }
 
     $settings = oblio_get_module_settings();
-    $collectOn = !empty($settings['enable_collect']) && $settings['enable_collect'] === 'on';
-    if (!$collectOn) {
+    if (empty($settings['enable_collect']) || $settings['enable_collect'] !== 'on') {
         return;
     }
 
-    // Only attempt if invoice is currently Paid
-    $invoice = WhmcsHelper::getInvoice($invoiceId);
-    if (empty($invoice) || $invoice['status'] !== 'Paid') {
+    $transactionId = !empty($vars['id']) ? (int)$vars['id'] : 0;
+    if ($transactionId === 0) {
+        logActivity('Oblio: AddTransaction for invoice #' . $invoiceId . ' has no transaction id; cannot record Incasare per-transaction.');
         return;
     }
 
-    // If a previous successful collect exists, this is a duplicate transaction
-    // for an already-collected invoice. Clear it so the new payment gets recorded.
-    try {
-        if (class_exists('\WHMCS\Database\Capsule')) {
-            \WHMCS\Database\Capsule::table('mod_oblio_invoices')
-                ->where('invoice_id', $invoiceId)
-                ->where('oblio_type', 'collect')
-                ->delete();
-        }
-    } catch (\Exception $e) {
-        logActivity('Oblio: AddTransaction #' . $invoiceId . ' - failed to clear previous collect rows: ' . $e->getMessage());
-    }
+    // Build the transaction record from $vars rather than calling getTransactionById -
+    // the DB row may not be visible yet inside the hook depending on transaction ordering.
+    $transaction = [
+        'id'        => $transactionId,
+        'transid'   => $vars['transid']  ?? '',
+        'gateway'   => $vars['gateway']  ?? '',
+        'amountin'  => $amountIn,
+        'date'      => $vars['date']     ?? date('Y-m-d'),
+    ];
 
-    logActivity('Oblio: AddTransaction fired for invoice #' . $invoiceId . ' (amountin=' . $amountIn . '); attempting Incasare.');
-    oblio_collect_document($invoiceId, $settings);
+    logActivity('Oblio: AddTransaction fired for invoice #' . $invoiceId . ' txn #' . $transactionId . ' (amountin=' . $amountIn . '); attempting Incasare.');
+    oblio_collect_document($invoiceId, $transaction, $settings);
 });
 
 
@@ -540,6 +562,12 @@ function oblio_create_whmcs_storno($invoiceId, $oblioStorno = null)
 /**
  * Shared handler for InvoiceCancelled / InvoiceRefunded. Runs the Oblio storno first so the
  * WHMCS storno can adopt the same fiscal number, keeping the two systems in sync.
+ *
+ * If the Oblio storno succeeded we also detach the WHMCS transactions from the cancelled
+ * invoice (set invoiceid=0) and clear the addon's collect-sync rows. The fiscal record is
+ * already reversed on the Oblio side; the WHMCS payment becomes a free-floating credit
+ * the admin can reattach to a replacement invoice and re-collect via Manual Sync. Without
+ * clearing the collect rows, isTransactionSynced() would block the re-collect.
  */
 function oblio_handle_storno_event($invoiceId, array $settings)
 {
@@ -550,6 +578,18 @@ function oblio_handle_storno_event($invoiceId, array $settings)
 
     if (!empty($settings['enable_whmcs_storno']) && $settings['enable_whmcs_storno'] === 'on') {
         oblio_create_whmcs_storno($invoiceId, $oblioStorno);
+    }
+
+    // Only detach transactions if the Oblio storno actually succeeded - we don't want
+    // to orphan WHMCS payments when the storno attempt failed and the original invoice
+    // is still live on the Oblio side.
+    if ($oblioStorno !== null) {
+        $detached = WhmcsHelper::detachTransactionsFromInvoice($invoiceId);
+        $cleared  = WhmcsHelper::clearCollectRowsForInvoice($invoiceId);
+        if ($detached > 0 || $cleared > 0) {
+            logActivity('Oblio: Storno cleanup for invoice #' . $invoiceId
+                . ' - detached ' . $detached . ' transaction(s), cleared ' . $cleared . ' collect row(s).');
+        }
     }
 }
 

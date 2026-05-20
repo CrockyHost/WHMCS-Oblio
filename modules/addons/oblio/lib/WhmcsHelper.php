@@ -241,18 +241,19 @@ class WhmcsHelper
      * @param string $status      'success' or 'error'
      * @param string $message     Additional message/error
      */
-    public static function logSync($invoiceId, $oblioType, $oblioSeries, $oblioNumber, $status, $message = '')
+    public static function logSync($invoiceId, $oblioType, $oblioSeries, $oblioNumber, $status, $message = '', $transactionId = null)
     {
         try {
             if (class_exists('\\WHMCS\\Database\\Capsule')) {
                 \WHMCS\Database\Capsule::table('mod_oblio_invoices')->insert([
-                    'invoice_id'   => $invoiceId,
-                    'oblio_type'   => $oblioType,
-                    'oblio_series' => $oblioSeries,
-                    'oblio_number' => $oblioNumber,
-                    'status'       => $status,
-                    'message'      => mb_substr($message, 0, 500),
-                    'created_at'   => date('Y-m-d H:i:s'),
+                    'invoice_id'     => $invoiceId,
+                    'oblio_type'     => $oblioType,
+                    'transaction_id' => $transactionId,
+                    'oblio_series'   => $oblioSeries,
+                    'oblio_number'   => $oblioNumber,
+                    'status'         => $status,
+                    'message'        => mb_substr($message, 0, 500),
+                    'created_at'     => date('Y-m-d H:i:s'),
                 ]); // Message truncated to 500 chars to fit the database text column safely
             }
         } catch (\Exception $e) {
@@ -262,6 +263,11 @@ class WhmcsHelper
 
     /**
      * Check if an invoice has already been synced as a specific document type.
+     *
+     * For 'collect' rows this answers "has ANY Incasare been recorded for this invoice?",
+     * which is what callers other than the per-transaction path want (e.g. legacy code
+     * or "was an invoice ever collected at all"). Use isTransactionSynced() to test for
+     * a specific WHMCS transaction.
      *
      * @param int    $invoiceId
      * @param string $oblioType 'invoice', 'collect', or 'storno'
@@ -281,6 +287,139 @@ class WhmcsHelper
             // Fall through
         }
         return false;
+    }
+
+    /**
+     * Check if a specific WHMCS transaction has already been sent as an Incasare to Oblio.
+     *
+     * Per-transaction tracking lets partial payments produce one Incasare each instead of
+     * the addon blocking all subsequent payments once one collect is recorded.
+     *
+     * @param int $invoiceId
+     * @param int $transactionId tblaccounts.id
+     * @return bool
+     */
+    public static function isTransactionSynced($invoiceId, $transactionId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'collect')
+                    ->where('transaction_id', $transactionId)
+                    ->where('status', 'success')
+                    ->exists();
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return false;
+    }
+
+    /**
+     * Get all positive-amount transactions attached to a WHMCS invoice.
+     *
+     * @param int $invoiceId
+     * @return array List of transaction records (each with at least: id, transid, gateway, amountin, date)
+     */
+    public static function getTransactions($invoiceId)
+    {
+        $result = localAPI('GetTransactions', ['invoiceid' => $invoiceId]);
+        if (empty($result['transactions']['transaction'])) {
+            return [];
+        }
+        $transactions = $result['transactions']['transaction'];
+        // localAPI returns a flat array for a single result, list-of-arrays for multiple
+        if (isset($transactions['id'])) {
+            $transactions = [$transactions];
+        }
+        $positive = [];
+        foreach ($transactions as $t) {
+            if ((float)($t['amountin'] ?? 0) > 0) {
+                $positive[] = $t;
+            }
+        }
+        return $positive;
+    }
+
+    /**
+     * Get a single transaction by its tblaccounts.id.
+     *
+     * GetTransactions doesn't accept an id filter, so we look up by invoice_id then match.
+     * Falls back to a direct DB lookup if the API can't find it (e.g. the transaction was
+     * just detached from its invoice via detachTransactionsFromInvoice).
+     *
+     * @param int $transactionId tblaccounts.id
+     * @return array|null
+     */
+    public static function getTransactionById($transactionId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                $row = \WHMCS\Database\Capsule::table('tblaccounts')
+                    ->where('id', $transactionId)
+                    ->first();
+                if ($row) {
+                    return (array)$row;
+                }
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return null;
+    }
+
+    /**
+     * Detach every transaction attached to a WHMCS invoice (set invoiceid=0).
+     *
+     * Used after a storno: the Oblio fiscal storno already reverses the invoice, so the
+     * WHMCS payment record stops being a debit against the cancelled invoice and becomes
+     * a free-floating credit the admin can reattach to a replacement invoice.
+     *
+     * Note: WHMCS doesn't fire AddTransaction or InvoicePaid when an admin edits an
+     * existing transaction's invoiceid. After reattaching, use the addon's Manual Sync
+     * panel to send the Incasare to Oblio.
+     *
+     * @param int $invoiceId
+     * @return int Number of transactions detached
+     */
+    public static function detachTransactionsFromInvoice($invoiceId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                return \WHMCS\Database\Capsule::table('tblaccounts')
+                    ->where('invoiceid', $invoiceId)
+                    ->update(['invoiceid' => 0]);
+            }
+        } catch (\Exception $e) {
+            logActivity('Oblio: Failed to detach transactions from invoice #' . $invoiceId . ': ' . $e->getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * Delete every 'collect' sync row for an invoice.
+     *
+     * Used after a storno so transactions detached and later reattached to a replacement
+     * invoice can be re-collected fresh, without isTransactionSynced() blocking them on
+     * stale rows that point to the now-stornoed invoice.
+     *
+     * @param int $invoiceId
+     * @return int Number of rows deleted
+     */
+    public static function clearCollectRowsForInvoice($invoiceId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'collect')
+                    ->delete();
+            }
+        } catch (\Exception $e) {
+            logActivity('Oblio: Failed to clear collect rows for invoice #' . $invoiceId . ': ' . $e->getMessage());
+        }
+        return 0;
     }
 
     /**

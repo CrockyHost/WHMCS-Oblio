@@ -45,7 +45,7 @@ function oblio_config()
     return [
         'name'        => 'Oblio Integration',
         'description' => 'Integrates WHMCS with Oblio.eu for automated invoice creation and payment collection (Incasare). Supports Romanian e-Factura regulations.',
-        'version'     => '1.3.2',
+        'version'     => '1.4.0',
         'author'      => '<a href="https://crocky.host" target="_blank" rel="noopener">CROCKY SRL</a>',
         'language'    => 'english',
         'fields'      => [
@@ -173,6 +173,7 @@ function oblio_activate()
                 $table->increments('id');
                 $table->integer('invoice_id')->unsigned();
                 $table->string('oblio_type', 20);       // 'invoice', 'collect', or 'storno'
+                $table->integer('transaction_id')->unsigned()->nullable(); // tblaccounts.id for collect rows; null for invoice/storno
                 $table->string('oblio_series', 50)->default('');
                 $table->string('oblio_number', 50)->default('');
                 $table->string('status', 20)->default(''); // 'success' or 'error'
@@ -180,6 +181,7 @@ function oblio_activate()
                 $table->timestamp('created_at')->useCurrent();
                 $table->index('invoice_id');
                 $table->index(['invoice_id', 'oblio_type']);
+                $table->index(['invoice_id', 'oblio_type', 'transaction_id'], 'idx_invoice_type_txn');
             });
         }
 
@@ -234,6 +236,17 @@ function oblio_upgrade($vars)
             $schema->create('mod_oblio_gateway_map', function ($table) {
                 $table->string('gateway', 100)->primary();
                 $table->string('collect_type', 50);
+            });
+        }
+
+        // 1.4.0: per-transaction collect tracking. Add transaction_id column to existing
+        // installs so multiple Incasari (partial payments) per WHMCS invoice can be tracked
+        // independently. Pre-existing 'collect' rows stay at NULL and are treated as
+        // legacy/whole-invoice records by isTransactionSynced (which falls back to isSynced).
+        if ($schema->hasTable('mod_oblio_invoices') && !$schema->hasColumn('mod_oblio_invoices', 'transaction_id')) {
+            $schema->table('mod_oblio_invoices', function ($table) {
+                $table->integer('transaction_id')->unsigned()->nullable()->after('oblio_type');
+                $table->index(['invoice_id', 'oblio_type', 'transaction_id'], 'idx_invoice_type_txn');
             });
         }
     }
@@ -598,43 +611,34 @@ function oblio_manual_sync($invoiceId, $docType, $vars)
             ];
         }
 
-        // Handle manual Incasare separately
+        // Handle manual Incasare separately: send one Incasare per WHMCS transaction
+        // that isn't already collected. Idempotent - re-running this on an
+        // already-collected invoice is a no-op (returns 0 sent).
         if ($docType === 'collect') {
             $syncedInvoice = WhmcsHelper::getSyncedInvoice($invoiceId);
             if (!$syncedInvoice) {
                 return ['success' => false, 'message' => 'No synced invoice found in Oblio for WHMCS invoice #' . $invoiceId . '. Sync the invoice first.'];
             }
 
-            $collectType = !empty($vars['collect_type']) ? $vars['collect_type'] : 'Ordin de plata';
-            $transaction  = WhmcsHelper::getLastTransaction($invoiceId);
-            $collect = [
-                'type'           => $collectType,
-                'issueDate'      => date('Y-m-d'),
-                'documentNumber' => 'WHMCS-' . $invoiceId,
-            ];
-            if ($transaction) {
-                $collect['type'] = WhmcsHelper::mapGatewayToCollectType($transaction['gateway'], $collectType);
-                if (!empty($transaction['amountin']) && (float)$transaction['amountin'] > 0) {
-                    $collect['value'] = round((float)$transaction['amountin'], 2);
-                }
-                if (!empty($transaction['date'])) {
-                    $collect['issueDate'] = date('Y-m-d', strtotime($transaction['date']));
-                }
-                if (!empty($transaction['transid'])) {
-                    $collect['documentNumber'] = $transaction['transid'];
-                } elseif (!empty($transaction['id'])) {
-                    $collect['documentNumber'] = (string)$transaction['id'];
-                }
+            $transactions = WhmcsHelper::getTransactions($invoiceId);
+            if (empty($transactions)) {
+                return ['success' => false, 'message' => 'No positive-amount transactions found on WHMCS invoice #' . $invoiceId . '.'];
             }
 
-            $api = new OblioApi($vars['api_email'], $vars['api_secret']);
-            $api->collectInvoice($vars['company_cif'], $syncedInvoice->oblio_series, $syncedInvoice->oblio_number, $collect);
+            $sent = oblio_collect_all_transactions($invoiceId, $vars);
+            $already = count($transactions) - $sent;
 
-            WhmcsHelper::logSync($invoiceId, 'collect', $syncedInvoice->oblio_series, $syncedInvoice->oblio_number, 'success', $collect['type']);
+            if ($sent === 0) {
+                return [
+                    'success' => true,
+                    'message' => 'Nothing to do - all ' . count($transactions) . ' transaction(s) already collected in Oblio.',
+                ];
+            }
 
             return [
                 'success' => true,
-                'message' => 'Incasare (' . $collect['type'] . ') recorded for ' . $syncedInvoice->oblio_series . ' #' . $syncedInvoice->oblio_number,
+                'message' => $sent . ' new Incasare(s) recorded for ' . $syncedInvoice->oblio_series . ' #' . $syncedInvoice->oblio_number
+                    . ($already > 0 ? ' (' . $already . ' already collected, skipped).' : '.'),
             ];
         }
 
