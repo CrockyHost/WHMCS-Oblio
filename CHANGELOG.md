@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.2 - Correct replacement-invoice email when the original was partially paid (2026-06-13)
+
+- When a late-fee amendment runs on an invoice that already had a partial payment, the replacement's "Invoice Created" email is now deferred until after the payment has been moved across, so the customer sees the real remaining balance instead of the full amount. Fully-unpaid invoices (the common case) are unchanged - their email still goes out at creation.
+- Reordered the amendment so the replacement is synced to Oblio before payments are moved onto it, and the original is cancelled last. This guarantees the moved payments have a fiscal invoice to attach their Incasari to, and that nothing is detached before it has been copied across.
+- `createReplacementInvoice()` gained a `$sendEmail` parameter to support the deferred-email path.
+
+To be explicit about the question this answers: yes, payments on a partially-paid invoice are carried over to the replacement (moved via `UpdateTransaction` and re-recorded as Incasari against the new Oblio invoice), and the customer is emailed the new invoice rather than the stale modified original.
+
 ## 1.5.1 - Manual "Storno + Reissue" admin button (2026-06-13)
 
 - Added a **Storno + Reissue (Late Fee)** panel to the addon's admin page. Enter an invoice ID to manually run the same storno-and-reissue flow the `AddInvoiceLateFee` cron hook uses: storno the original in Oblio, reissue it (current items plus any late fee) as a new fiscal invoice, and cancel the original in WHMCS. Useful for backfilling when the cron hook did not fire, or for reissuing an invoice you edited. Confirmation prompt before it runs.

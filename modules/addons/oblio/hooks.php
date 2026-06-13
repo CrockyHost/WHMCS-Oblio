@@ -673,36 +673,32 @@ function oblio_handle_late_fee_amendment($invoiceId, array $settings)
             return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
         }
 
-        // Snapshot any payments on the original BEFORE we cancel it (rare: a partially-paid
-        // invoice that still went overdue on its balance). We reattach these to the
-        // replacement afterwards so the customer's payment follows them to the new document.
+        // Snapshot any payments on the original BEFORE we touch it (rare: a partially-paid
+        // invoice that still went overdue on its balance). We move these to the replacement
+        // so the customer's payment follows them to the new document.
         $oldTransactions = WhmcsHelper::getTransactions($invoiceId);
+        $hasPayments = !empty($oldTransactions);
 
-        // 1. Reissue: copy original items + the new late fee into a fresh invoice.
-        //    sendinvoice=true emails the customer the replacement and (via
-        //    InvoiceCreationPreEmail) auto-syncs it to Oblio.
-        $newInvoiceId = WhmcsHelper::createReplacementInvoice($invoiceId, 7);
+        // 1. Reissue: copy original items + the new late fee into a fresh invoice. If the
+        //    original carried payments, defer the customer email (sendEmail=false) until
+        //    after we've moved those payments across, so the email shows the real remaining
+        //    balance instead of the full amount.
+        $newInvoiceId = WhmcsHelper::createReplacementInvoice($invoiceId, 7, !$hasPayments);
 
         // 2. Record the link immediately so EmailPreSend can suppress the original's
         //    overdue/modified emails that fire later in this same cron pass.
         WhmcsHelper::logAmendment($invoiceId, $newInvoiceId);
 
-        // 3. Make sure the replacement is in Oblio (idempotent - the PreEmail hook above
-        //    usually already did this; isSynced() makes the second call a no-op).
+        // 3. Sync the replacement to Oblio before moving any payments onto it, so the
+        //    Incasari in step 4 have a fiscal invoice to attach to. Idempotent - if
+        //    sendEmail was true, InvoiceCreationPreEmail usually already synced it.
         oblio_send_document($newInvoiceId, 'invoice', $settings);
 
-        // 4. Cancel the original. This fires InvoiceCancelled -> oblio_handle_storno_event,
-        //    which storno's the original in Oblio, optionally mirrors it in WHMCS, detaches
-        //    its transactions and clears its collect rows.
-        $cancel = localAPI('UpdateInvoice', ['invoiceid' => $invoiceId, 'status' => 'Cancelled']);
-        if (($cancel['result'] ?? '') !== 'success') {
-            logActivity('Oblio: Late fee amendment - failed to cancel original invoice #' . $invoiceId . ': ' . ($cancel['message'] ?? 'unknown'));
-        }
-
-        // 5. Partially-paid edge: reattach the snapshotted payments to the replacement and
-        //    record them as Incasari against the new Oblio invoice. (No-op for the common
-        //    fully-unpaid overdue case.)
-        if (!empty($oldTransactions)) {
+        // 4. Partially-paid edge: move the snapshotted payments to the replacement, record
+        //    them as Incasari against the new Oblio invoice, then send the deferred invoice
+        //    email now that the balance is correct. (Skipped entirely for the common
+        //    fully-unpaid overdue case, where the email already went out in step 1.)
+        if ($hasPayments) {
             foreach ($oldTransactions as $t) {
                 $tid = (int)($t['id'] ?? 0);
                 if ($tid === 0) {
@@ -710,11 +706,25 @@ function oblio_handle_late_fee_amendment($invoiceId, array $settings)
                 }
                 $reattach = localAPI('UpdateTransaction', ['transactionid' => $tid, 'invoiceid' => $newInvoiceId]);
                 if (($reattach['result'] ?? '') !== 'success') {
-                    logActivity('Oblio: Late fee amendment - failed to reattach transaction #' . $tid . ' to invoice #' . $newInvoiceId . ': ' . ($reattach['message'] ?? 'unknown'));
+                    logActivity('Oblio: Late fee amendment - failed to move transaction #' . $tid . ' to invoice #' . $newInvoiceId . ': ' . ($reattach['message'] ?? 'unknown'));
                 }
             }
             $recollected = oblio_collect_all_transactions($newInvoiceId, $settings);
-            logActivity('Oblio: Late fee amendment - reattached ' . count($oldTransactions) . ' payment(s) to invoice #' . $newInvoiceId . ', recorded ' . $recollected . ' Incasare(s).');
+
+            $mail = localAPI('SendEmail', ['messagename' => 'Invoice Created', 'id' => $newInvoiceId]);
+            if (($mail['result'] ?? '') !== 'success') {
+                logActivity('Oblio: Late fee amendment - replacement #' . $newInvoiceId . ' created but its invoice email was not sent: ' . ($mail['message'] ?? 'unknown'));
+            }
+            logActivity('Oblio: Late fee amendment - moved ' . count($oldTransactions) . ' payment(s) to invoice #' . $newInvoiceId . ', recorded ' . $recollected . ' Incasare(s).');
+        }
+
+        // 5. Cancel the original. This fires InvoiceCancelled -> oblio_handle_storno_event,
+        //    which storno's the original in Oblio, optionally mirrors it in WHMCS, detaches
+        //    any remaining transactions and clears its collect rows. By now the payments
+        //    (if any) have already been moved to the replacement.
+        $cancel = localAPI('UpdateInvoice', ['invoiceid' => $invoiceId, 'status' => 'Cancelled']);
+        if (($cancel['result'] ?? '') !== 'success') {
+            logActivity('Oblio: Late fee amendment - failed to cancel original invoice #' . $invoiceId . ': ' . ($cancel['message'] ?? 'unknown'));
         }
 
         $msg = 'Invoice #' . $invoiceId . ' (' . $synced->oblio_series . '-' . $synced->oblio_number

@@ -790,17 +790,20 @@ class WhmcsHelper
      * it's in SPV, so when WHMCS bolts a late fee onto it we storno the original and reissue
      * the whole thing - original items plus the fee - as a brand new fiscal document.
      *
-     * The new invoice is created with sendinvoice=true so the customer receives the standard
-     * "Invoice Created" email pointing at the new invoice. The due date is pushed out by
-     * $dueDays so the replacement isn't itself immediately overdue (which would re-trigger
-     * the late-fee cron and loop).
+     * When $sendEmail is true the customer receives the standard "Invoice Created" email at
+     * creation. The caller passes false when the original invoice carried payments, so the
+     * email can be deferred until those payments have been moved across and the invoice shows
+     * the real outstanding balance rather than the full amount. The due date is pushed out by
+     * $dueDays so the replacement isn't itself immediately overdue (which would re-trigger the
+     * late-fee cron and loop).
      *
-     * @param int $oldInvoiceId WHMCS invoice being replaced
-     * @param int $dueDays      Days from today for the new invoice's due date
+     * @param int  $oldInvoiceId WHMCS invoice being replaced
+     * @param int  $dueDays      Days from today for the new invoice's due date
+     * @param bool $sendEmail    Send the "Invoice Created" email now (true) or let the caller send it later (false)
      * @return int New WHMCS invoice ID
      * @throws \Exception
      */
-    public static function createReplacementInvoice($oldInvoiceId, $dueDays = 7)
+    public static function createReplacementInvoice($oldInvoiceId, $dueDays = 7, $sendEmail = true)
     {
         $original = self::getInvoice($oldInvoiceId);
         if (empty($original)) {
@@ -827,7 +830,7 @@ class WhmcsHelper
             'taxrate'     => isset($original['taxrate']) ? (float)$original['taxrate'] : 0,
             'taxrate2'    => isset($original['taxrate2']) ? (float)$original['taxrate2'] : 0,
             'notes'       => 'Reissue of Invoice ' . $origLabel . ' with late fee (original stornoed).',
-            'sendinvoice' => true,
+            'sendinvoice' => (bool)$sendEmail,
         ];
 
         // Copy every non-zero line item forward at its original sign (positive), preserving
