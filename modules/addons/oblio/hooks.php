@@ -623,37 +623,54 @@ add_hook('InvoiceRefunded', 1, function ($vars) {
  * stops dunning. The misleading "modified invoice" / overdue emails WHMCS sends for the now
  * defunct original are suppressed in the EmailPreSend hook below.
  *
+ * Returns a result array so the admin "Storno + Reissue" button can surface the outcome;
+ * the AddInvoiceLateFee hook ignores the return value (everything is also logged).
+ *
  * @param int   $invoiceId Original WHMCS invoice the late fee was added to
  * @param array $settings  Module settings
+ * @return array ['success' => bool, 'message' => string, 'newInvoiceId' => int|null]
  */
 function oblio_handle_late_fee_amendment($invoiceId, array $settings)
 {
     try {
+        // The amendment storno's the original via the InvoiceCancelled path, which only acts
+        // when Oblio Storno is enabled. Without it we'd cancel + reissue but leave the original
+        // live in Oblio - a broken half-state. Refuse up front instead.
+        if (empty($settings['enable_storno']) || $settings['enable_storno'] !== 'on') {
+            $msg = 'Enable Oblio Storno on Cancel/Refund must be turned on for late-fee amendment to reverse the original.';
+            logActivity('Oblio: Late fee amendment - ' . $msg);
+            return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
+        }
+
         // Must be a fiscal invoice we actually issued in Oblio - otherwise nothing to reissue.
         $synced = WhmcsHelper::getSyncedInvoice($invoiceId);
         if (!$synced) {
-            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - not synced to Oblio; leaving WHMCS to handle it normally.');
-            return;
+            $msg = 'Invoice #' . $invoiceId . ' is not synced to Oblio; nothing to reissue.';
+            logActivity('Oblio: Late fee amendment - ' . $msg);
+            return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
         }
 
         // Re-entrancy / double-fire guard.
         if (WhmcsHelper::isAmended($invoiceId)) {
-            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - already amended; skipping.');
-            return;
+            $msg = 'Invoice #' . $invoiceId . ' was already stornoed and replaced; skipping.';
+            logActivity('Oblio: Late fee amendment - ' . $msg);
+            return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
         }
 
         $invoice = WhmcsHelper::getInvoice($invoiceId);
         if (empty($invoice)) {
-            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - invoice not found; skipping.');
-            return;
+            $msg = 'Invoice #' . $invoiceId . ' not found.';
+            logActivity('Oblio: Late fee amendment - ' . $msg);
+            return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
         }
 
         // Only amend invoices that are still open. A Paid/Cancelled/Refunded invoice
         // shouldn't be receiving a late fee in the first place; don't touch it.
         $status = $invoice['status'] ?? '';
         if (!in_array($status, ['Unpaid', 'Collections'], true)) {
-            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - status is "' . $status . '", not open; skipping amendment.');
-            return;
+            $msg = 'Invoice #' . $invoiceId . ' has status "' . $status . '", not open; refusing to amend.';
+            logActivity('Oblio: Late fee amendment - ' . $msg);
+            return ['success' => false, 'message' => $msg, 'newInvoiceId' => null];
         }
 
         // Snapshot any payments on the original BEFORE we cancel it (rare: a partially-paid
@@ -700,11 +717,14 @@ function oblio_handle_late_fee_amendment($invoiceId, array $settings)
             logActivity('Oblio: Late fee amendment - reattached ' . count($oldTransactions) . ' payment(s) to invoice #' . $newInvoiceId . ', recorded ' . $recollected . ' Incasare(s).');
         }
 
-        logActivity('Oblio: Late fee amendment - invoice #' . $invoiceId . ' (' . $synced->oblio_series . '-' . $synced->oblio_number
-            . ') stornoed and reissued as WHMCS invoice #' . $newInvoiceId . '.');
+        $msg = 'Invoice #' . $invoiceId . ' (' . $synced->oblio_series . '-' . $synced->oblio_number
+            . ') stornoed and reissued as WHMCS invoice #' . $newInvoiceId . '.';
+        logActivity('Oblio: Late fee amendment - ' . $msg);
+        return ['success' => true, 'message' => $msg, 'newInvoiceId' => $newInvoiceId];
 
     } catch (\Exception $e) {
         logActivity('Oblio: Late fee amendment failed for invoice #' . $invoiceId . ': ' . $e->getMessage());
+        return ['success' => false, 'message' => 'Late fee amendment failed: ' . $e->getMessage(), 'newInvoiceId' => null];
     }
 }
 

@@ -45,7 +45,7 @@ function oblio_config()
     return [
         'name'        => 'Oblio Integration',
         'description' => 'Integrates WHMCS with Oblio.eu for automated invoice creation and payment collection (Incasare). Supports Romanian e-Factura regulations.',
-        'version'     => '1.5.0',
+        'version'     => '1.5.1',
         'author'      => '<a href="https://crocky.host" target="_blank" rel="noopener">CROCKY SRL</a>',
         'language'    => 'english',
         'fields'      => [
@@ -289,6 +289,13 @@ function oblio_output($vars)
             } else {
                 echo '<div class="alert alert-danger">' . htmlspecialchars($result['message'], ENT_QUOTES, 'UTF-8') . '</div>';
             }
+        } elseif ($_POST['action'] === 'amend_late_fee' && !empty($_POST['invoice_id'])) {
+            $result = oblio_manual_late_fee_amendment((int)$_POST['invoice_id'], $vars);
+            if ($result['success']) {
+                echo '<div class="alert alert-success">' . htmlspecialchars($result['message'], ENT_QUOTES, 'UTF-8') . '</div>';
+            } else {
+                echo '<div class="alert alert-danger">' . htmlspecialchars($result['message'], ENT_QUOTES, 'UTF-8') . '</div>';
+            }
         } elseif ($_POST['action'] === 'test_connection') {
             $result = oblio_test_connection($vars);
             if ($result['success']) {
@@ -345,6 +352,22 @@ function oblio_output($vars)
     echo '</select>';
     echo '</div>';
     echo '<button type="submit" class="btn btn-primary">Sync to Oblio</button>';
+    echo '</form>';
+    echo '</div></div>';
+
+    // Late-fee amendment (storno + reissue) panel
+    echo '<div class="panel panel-default">';
+    echo '<div class="panel-heading"><h3 class="panel-title">Storno + Reissue (Late Fee)</h3></div>';
+    echo '<div class="panel-body">';
+    echo '<p class="text-muted">Manually run the late-fee workaround on an invoice: storno the original in Oblio and reissue it (original items plus any late fee currently on it) as a new fiscal invoice, then cancel the original in WHMCS. Use this when the automated <code>AddInvoiceLateFee</code> hook did not fire, or to reissue an invoice you have edited. The invoice must be synced to Oblio and still open (Unpaid/Collections).</p>';
+    echo '<form method="post" action="' . htmlspecialchars($moduleLink, ENT_QUOTES, 'UTF-8') . '" class="form-inline" onsubmit="return confirm(\'This will STORNO the original invoice in Oblio and create a replacement. The original WHMCS invoice will be cancelled. Continue?\');">';
+    echo '<input type="hidden" name="action" value="amend_late_fee">';
+    echo '<input type="hidden" name="csrf_token" value="' . htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') . '">';
+    echo '<div class="form-group" style="margin-right:10px;">';
+    echo '<label for="amend_invoice_id" style="margin-right:5px;">Invoice ID:</label>';
+    echo '<input type="number" name="invoice_id" id="amend_invoice_id" class="form-control" required>';
+    echo '</div>';
+    echo '<button type="submit" class="btn btn-warning">Storno + Reissue</button>';
     echo '</form>';
     echo '</div></div>';
 
@@ -681,4 +704,37 @@ function oblio_manual_sync($invoiceId, $docType, $vars)
         WhmcsHelper::logSync($invoiceId, $docType, '', '', 'error', $e->getMessage());
         return ['success' => false, 'message' => $e->getMessage()];
     }
+}
+
+/**
+ * Manually run the late-fee storno + reissue on an invoice from the admin panel.
+ *
+ * Thin wrapper around oblio_handle_late_fee_amendment() (defined in hooks.php, loaded on
+ * every request) so the admin "Storno + Reissue" button can trigger the same flow the
+ * AddInvoiceLateFee cron hook uses, and surface the result. Works regardless of the
+ * "Storno + Reissue on Late Fee" setting - that flag only gates the automatic hook and the
+ * email suppression, not this explicit admin action.
+ *
+ * @param int   $invoiceId WHMCS invoice ID
+ * @param array $vars      Module configuration variables
+ * @return array ['success' => bool, 'message' => string]
+ */
+function oblio_manual_late_fee_amendment($invoiceId, $vars)
+{
+    if (empty($vars['api_email']) || empty($vars['api_secret'])) {
+        return ['success' => false, 'message' => 'API credentials not configured.'];
+    }
+    if (empty($vars['company_cif'])) {
+        return ['success' => false, 'message' => 'Company CIF not configured.'];
+    }
+    if (!function_exists('oblio_handle_late_fee_amendment')) {
+        return ['success' => false, 'message' => 'Late-fee amendment handler not loaded. Is the addon hooks file present?'];
+    }
+
+    $result = oblio_handle_late_fee_amendment($invoiceId, $vars);
+
+    return [
+        'success' => !empty($result['success']),
+        'message' => $result['message'] ?? 'Unknown result.',
+    ];
 }

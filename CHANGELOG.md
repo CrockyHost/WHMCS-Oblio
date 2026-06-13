@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.1 - Manual "Storno + Reissue" admin button (2026-06-13)
+
+- Added a **Storno + Reissue (Late Fee)** panel to the addon's admin page. Enter an invoice ID to manually run the same storno-and-reissue flow the `AddInvoiceLateFee` cron hook uses: storno the original in Oblio, reissue it (current items plus any late fee) as a new fiscal invoice, and cancel the original in WHMCS. Useful for backfilling when the cron hook did not fire, or for reissuing an invoice you edited. Confirmation prompt before it runs.
+- The manual action works regardless of the "Storno + Reissue on Late Fee" setting (that flag only gates the automatic hook and the email suppression).
+- `oblio_handle_late_fee_amendment()` now returns a result array and refuses up front if "Enable Oblio Storno on Cancel/Refund" is off, so the amendment never cancels-and-reissues without actually reversing the original in Oblio. This precondition applies to both the automatic hook and the manual button.
+
 ## 1.5.0 - Storno and reissue when WHMCS adds a late fee (2026-06-13)
 
 Romanian fiscal invoices cannot be edited once issued (and especially once submitted to SPV/e-Factura), but WHMCS's automated late-fee routine edits overdue invoices in place. This release adds an opt-in workaround.
