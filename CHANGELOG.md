@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0 - Storno and reissue when WHMCS adds a late fee (2026-06-13)
+
+Romanian fiscal invoices cannot be edited once issued (and especially once submitted to SPV/e-Factura), but WHMCS's automated late-fee routine edits overdue invoices in place. This release adds an opt-in workaround.
+
+### Added
+
+- **`Storno + Reissue on Late Fee` setting (default OFF).** When enabled, the new `AddInvoiceLateFee` hook reacts to WHMCS adding a late fee to an Oblio-synced invoice by:
+  1. Reissuing the whole invoice (original line items plus the new late fee) as a fresh WHMCS invoice, emailed to the customer and auto-synced to Oblio as a new fiscal document.
+  2. Cancelling the original WHMCS invoice, which storno's it in Oblio (and optionally mirrors the storno in WHMCS, per the existing setting).
+  3. Reattaching any payments from the original to the replacement and re-recording them as Incasari against the new Oblio invoice (covers the partially-paid-then-overdue edge case).
+- **`EmailPreSend` suppression** for the now-defunct original invoice, active only when the setting is on:
+  - "Invoice Modified" emails are never sent for an Oblio-synced invoice (an issued fiscal invoice is reissued, not modified). This rule is order-independent so it works even if WHMCS queues the email before the late-fee hook fires.
+  - Overdue notices and payment reminders are suppressed for an invoice stornoed and replaced within the last 10 minutes.
+
+### Notes
+
+- The replacement invoice's due date is set to 7 days out so it is not itself immediately overdue (which would re-trigger the late-fee cron). If it does go overdue later, it is amended again the same way.
+- The new invoice reaches SPV through your existing Oblio submission flow (the addon submits to SPV on payment when `Auto-send e-Factura to SPV` is enabled, or Oblio can auto-submit on issuance if configured in your Oblio account).
+- Reuses the `transaction_id` column added in 1.4.0 to store the old to new invoice link (`oblio_type = 'amended'`); no schema change.
+
 ## 1.4.0 - Per-transaction Incasare tracking, storno transaction cleanup (2026-05-13)
 
 Schema change: adds nullable `transaction_id` column to `mod_oblio_invoices`. Existing installs auto-migrate via `oblio_upgrade()`. Pre-existing `collect` rows stay at NULL and are treated as legacy whole-invoice records.

@@ -612,3 +612,156 @@ add_hook('InvoiceCancelled', 1, function ($vars) {
 add_hook('InvoiceRefunded', 1, function ($vars) {
     oblio_handle_storno_event($vars['invoiceid'], oblio_get_module_settings());
 });
+
+/**
+ * Storno-and-reissue an Oblio-synced invoice that WHMCS just bolted a late fee onto.
+ *
+ * Romanian fiscal invoices, once issued (and especially once submitted to SPV), cannot be
+ * edited. WHMCS's automated late-fee routine edits the invoice in place anyway. To stay
+ * compliant we instead: reissue the whole invoice (original items + the new late fee) as a
+ * fresh Oblio document, storno the original, and cancel the original WHMCS invoice so it
+ * stops dunning. The misleading "modified invoice" / overdue emails WHMCS sends for the now
+ * defunct original are suppressed in the EmailPreSend hook below.
+ *
+ * @param int   $invoiceId Original WHMCS invoice the late fee was added to
+ * @param array $settings  Module settings
+ */
+function oblio_handle_late_fee_amendment($invoiceId, array $settings)
+{
+    try {
+        // Must be a fiscal invoice we actually issued in Oblio - otherwise nothing to reissue.
+        $synced = WhmcsHelper::getSyncedInvoice($invoiceId);
+        if (!$synced) {
+            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - not synced to Oblio; leaving WHMCS to handle it normally.');
+            return;
+        }
+
+        // Re-entrancy / double-fire guard.
+        if (WhmcsHelper::isAmended($invoiceId)) {
+            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - already amended; skipping.');
+            return;
+        }
+
+        $invoice = WhmcsHelper::getInvoice($invoiceId);
+        if (empty($invoice)) {
+            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - invoice not found; skipping.');
+            return;
+        }
+
+        // Only amend invoices that are still open. A Paid/Cancelled/Refunded invoice
+        // shouldn't be receiving a late fee in the first place; don't touch it.
+        $status = $invoice['status'] ?? '';
+        if (!in_array($status, ['Unpaid', 'Collections'], true)) {
+            logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - status is "' . $status . '", not open; skipping amendment.');
+            return;
+        }
+
+        // Snapshot any payments on the original BEFORE we cancel it (rare: a partially-paid
+        // invoice that still went overdue on its balance). We reattach these to the
+        // replacement afterwards so the customer's payment follows them to the new document.
+        $oldTransactions = WhmcsHelper::getTransactions($invoiceId);
+
+        // 1. Reissue: copy original items + the new late fee into a fresh invoice.
+        //    sendinvoice=true emails the customer the replacement and (via
+        //    InvoiceCreationPreEmail) auto-syncs it to Oblio.
+        $newInvoiceId = WhmcsHelper::createReplacementInvoice($invoiceId, 7);
+
+        // 2. Record the link immediately so EmailPreSend can suppress the original's
+        //    overdue/modified emails that fire later in this same cron pass.
+        WhmcsHelper::logAmendment($invoiceId, $newInvoiceId);
+
+        // 3. Make sure the replacement is in Oblio (idempotent - the PreEmail hook above
+        //    usually already did this; isSynced() makes the second call a no-op).
+        oblio_send_document($newInvoiceId, 'invoice', $settings);
+
+        // 4. Cancel the original. This fires InvoiceCancelled -> oblio_handle_storno_event,
+        //    which storno's the original in Oblio, optionally mirrors it in WHMCS, detaches
+        //    its transactions and clears its collect rows.
+        $cancel = localAPI('UpdateInvoice', ['invoiceid' => $invoiceId, 'status' => 'Cancelled']);
+        if (($cancel['result'] ?? '') !== 'success') {
+            logActivity('Oblio: Late fee amendment - failed to cancel original invoice #' . $invoiceId . ': ' . ($cancel['message'] ?? 'unknown'));
+        }
+
+        // 5. Partially-paid edge: reattach the snapshotted payments to the replacement and
+        //    record them as Incasari against the new Oblio invoice. (No-op for the common
+        //    fully-unpaid overdue case.)
+        if (!empty($oldTransactions)) {
+            foreach ($oldTransactions as $t) {
+                $tid = (int)($t['id'] ?? 0);
+                if ($tid === 0) {
+                    continue;
+                }
+                $reattach = localAPI('UpdateTransaction', ['transactionid' => $tid, 'invoiceid' => $newInvoiceId]);
+                if (($reattach['result'] ?? '') !== 'success') {
+                    logActivity('Oblio: Late fee amendment - failed to reattach transaction #' . $tid . ' to invoice #' . $newInvoiceId . ': ' . ($reattach['message'] ?? 'unknown'));
+                }
+            }
+            $recollected = oblio_collect_all_transactions($newInvoiceId, $settings);
+            logActivity('Oblio: Late fee amendment - reattached ' . count($oldTransactions) . ' payment(s) to invoice #' . $newInvoiceId . ', recorded ' . $recollected . ' Incasare(s).');
+        }
+
+        logActivity('Oblio: Late fee amendment - invoice #' . $invoiceId . ' (' . $synced->oblio_series . '-' . $synced->oblio_number
+            . ') stornoed and reissued as WHMCS invoice #' . $newInvoiceId . '.');
+
+    } catch (\Exception $e) {
+        logActivity('Oblio: Late fee amendment failed for invoice #' . $invoiceId . ': ' . $e->getMessage());
+    }
+}
+
+/**
+ * Hook: AddInvoiceLateFee
+ *
+ * Fires after WHMCS adds a late fee line item to an overdue invoice. If late-fee amendment
+ * is enabled, we storno-and-reissue instead of leaving the original fiscally edited.
+ */
+add_hook('AddInvoiceLateFee', 1, function ($vars) {
+    if (empty($vars['invoiceid'])) {
+        return;
+    }
+    $settings = oblio_get_module_settings();
+    if (empty($settings['enable_late_fee_amendment']) || $settings['enable_late_fee_amendment'] !== 'on') {
+        return;
+    }
+    oblio_handle_late_fee_amendment((int)$vars['invoiceid'], $settings);
+});
+
+/**
+ * Hook: EmailPreSend
+ *
+ * Suppresses the emails WHMCS would otherwise send about an invoice we just stornoed and
+ * replaced via the late-fee amendment flow:
+ *
+ *   - "Invoice Modified" for any Oblio-synced invoice: an issued fiscal invoice must never
+ *     be edited in place, so this email is always misleading for synced invoices. Aborting
+ *     it is order-independent (works even if WHMCS sends it before AddInvoiceLateFee fires).
+ *   - Overdue notices / payment reminders for an invoice amended in the last few minutes:
+ *     the original is now cancelled and replaced, so its dunning emails are stale.
+ *
+ * Only active when late-fee amendment is enabled.
+ */
+add_hook('EmailPreSend', 1, function ($vars) {
+    $settings = oblio_get_module_settings();
+    if (empty($settings['enable_late_fee_amendment']) || $settings['enable_late_fee_amendment'] !== 'on') {
+        return;
+    }
+
+    $messagename = (string)($vars['messagename'] ?? '');
+    $relid       = (int)($vars['relid'] ?? 0);
+    if ($relid === 0 || $messagename === '') {
+        return;
+    }
+
+    // Rule A: never send "Invoice Modified" for a fiscal invoice that lives in Oblio.
+    if (stripos($messagename, 'Modified') !== false && WhmcsHelper::getSyncedInvoice($relid)) {
+        logActivity('Oblio: Suppressed "' . $messagename . '" email for Oblio-synced invoice #' . $relid . ' (fiscal invoices are reissued, not modified).');
+        return ['abortsend' => true];
+    }
+
+    // Rule B: suppress dunning emails for a freshly amended (stornoed + replaced) invoice.
+    $isDunning = stripos($messagename, 'Overdue') !== false
+        || stripos($messagename, 'Reminder') !== false;
+    if ($isDunning && WhmcsHelper::wasRecentlyAmended($relid, 600)) {
+        logActivity('Oblio: Suppressed "' . $messagename . '" email for invoice #' . $relid . ' (stornoed and replaced by late-fee amendment).');
+        return ['abortsend' => true];
+    }
+});

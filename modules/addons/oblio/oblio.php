@@ -45,7 +45,7 @@ function oblio_config()
     return [
         'name'        => 'Oblio Integration',
         'description' => 'Integrates WHMCS with Oblio.eu for automated invoice creation and payment collection (Incasare). Supports Romanian e-Factura regulations.',
-        'version'     => '1.4.0',
+        'version'     => '1.5.0',
         'author'      => '<a href="https://crocky.host" target="_blank" rel="noopener">CROCKY SRL</a>',
         'language'    => 'english',
         'fields'      => [
@@ -112,6 +112,11 @@ function oblio_config()
                 'FriendlyName' => 'Create WHMCS Storno Invoice',
                 'Type'         => 'yesno',
                 'Description'  => 'Automatically create a negative credit note invoice in WHMCS (status: Storno) when an invoice is cancelled or refunded.',
+            ],
+            'enable_late_fee_amendment' => [
+                'FriendlyName' => 'Storno + Reissue on Late Fee',
+                'Type'         => 'yesno',
+                'Description'  => 'When WHMCS adds a late fee to an already-issued Oblio invoice (which cannot be fiscally edited once in SPV), automatically storno the original and reissue the whole invoice plus the late fee as a new fiscal document. Suppresses WHMCS\'s misleading "modified invoice" and overdue emails for the original. Leave OFF unless you issue invoices to SPV.',
             ],
             'collect_type' => [
                 'FriendlyName' => 'Default Payment Method',

@@ -781,4 +781,152 @@ class WhmcsHelper
             logActivity('Oblio: Failed to advance invoice number counters: ' . $e->getMessage());
         }
     }
+
+    /**
+     * Create a replacement WHMCS invoice that copies an existing invoice's current line
+     * items (including any just-added late fee) into a fresh Unpaid invoice.
+     *
+     * Used by the late-fee amendment flow: an Oblio-issued invoice can't be edited once
+     * it's in SPV, so when WHMCS bolts a late fee onto it we storno the original and reissue
+     * the whole thing - original items plus the fee - as a brand new fiscal document.
+     *
+     * The new invoice is created with sendinvoice=true so the customer receives the standard
+     * "Invoice Created" email pointing at the new invoice. The due date is pushed out by
+     * $dueDays so the replacement isn't itself immediately overdue (which would re-trigger
+     * the late-fee cron and loop).
+     *
+     * @param int $oldInvoiceId WHMCS invoice being replaced
+     * @param int $dueDays      Days from today for the new invoice's due date
+     * @return int New WHMCS invoice ID
+     * @throws \Exception
+     */
+    public static function createReplacementInvoice($oldInvoiceId, $dueDays = 7)
+    {
+        $original = self::getInvoice($oldInvoiceId);
+        if (empty($original)) {
+            throw new \Exception('Original invoice #' . $oldInvoiceId . ' not found.');
+        }
+
+        $items = $original['items']['item'];
+        if (isset($items['id'])) {
+            $items = [$items];
+        }
+
+        // Reference the original Oblio fiscal number in the new invoice's notes so the paper
+        // trail reads clearly (e.g. "Reissue of CRK-0022 with late fee").
+        $synced = self::getSyncedInvoice($oldInvoiceId);
+        $origLabel = ($synced && $synced->oblio_series !== '' && $synced->oblio_number !== '')
+            ? $synced->oblio_series . '-' . $synced->oblio_number
+            : '#' . $oldInvoiceId;
+
+        $params = [
+            'userid'      => $original['userid'],
+            'status'      => 'Unpaid',
+            'date'        => date('Ymd'),
+            'duedate'     => date('Ymd', strtotime('+' . (int)$dueDays . ' days')),
+            'taxrate'     => isset($original['taxrate']) ? (float)$original['taxrate'] : 0,
+            'taxrate2'    => isset($original['taxrate2']) ? (float)$original['taxrate2'] : 0,
+            'notes'       => 'Reissue of Invoice ' . $origLabel . ' with late fee (original stornoed).',
+            'sendinvoice' => true,
+        ];
+
+        // Copy every non-zero line item forward at its original sign (positive), preserving
+        // the per-item taxed flag. The late fee WHMCS just added is one of these items.
+        $n = 1;
+        foreach ($items as $item) {
+            if ((float)$item['amount'] == 0) {
+                continue;
+            }
+            $params['itemdescription' . $n] = $item['description'];
+            $params['itemamount' . $n]      = round((float)$item['amount'], 2);
+            $params['itemtaxed' . $n]       = !empty($item['taxed']) ? 1 : 0;
+            $n++;
+        }
+
+        if ($n === 1) {
+            throw new \Exception('No line items to copy for invoice #' . $oldInvoiceId . '.');
+        }
+
+        $result = localAPI('CreateInvoice', $params);
+        if ($result['result'] !== 'success') {
+            throw new \Exception('Failed to create replacement invoice in WHMCS: ' . ($result['message'] ?? 'Unknown error'));
+        }
+
+        return (int)$result['invoiceid'];
+    }
+
+    /**
+     * Record that an invoice was stornoed-and-replaced (late-fee amendment), linking the
+     * old invoice to its replacement so EmailPreSend can suppress the now-defunct invoice's
+     * dunning/modified emails.
+     *
+     * Stored as an 'amended' row in mod_oblio_invoices: invoice_id = old, transaction_id =
+     * new invoice id (reusing the column to carry the link without a schema change).
+     *
+     * @param int $oldInvoiceId
+     * @param int $newInvoiceId
+     */
+    public static function logAmendment($oldInvoiceId, $newInvoiceId)
+    {
+        self::logSync(
+            $oldInvoiceId,
+            'amended',
+            '',
+            '',
+            'success',
+            'Stornoed and replaced by WHMCS invoice #' . $newInvoiceId,
+            $newInvoiceId
+        );
+    }
+
+    /**
+     * Was this invoice stornoed-and-replaced within the last $windowSeconds?
+     *
+     * Used by EmailPreSend to suppress overdue notices / modified-invoice emails that WHMCS
+     * fires for the original invoice during the same cron pass that added the late fee.
+     *
+     * @param int $invoiceId
+     * @param int $windowSeconds
+     * @return bool
+     */
+    public static function wasRecentlyAmended($invoiceId, $windowSeconds = 600)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                $cutoff = date('Y-m-d H:i:s', strtotime('-' . (int)$windowSeconds . ' seconds'));
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'amended')
+                    ->where('status', 'success')
+                    ->where('created_at', '>=', $cutoff)
+                    ->exists();
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return false;
+    }
+
+    /**
+     * Has this invoice already been amended (stornoed-and-replaced) at any point?
+     * Re-entrancy guard so a second AddInvoiceLateFee on the same invoice is a no-op.
+     *
+     * @param int $invoiceId
+     * @return bool
+     */
+    public static function isAmended($invoiceId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'amended')
+                    ->where('status', 'success')
+                    ->exists();
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return false;
+    }
 }
