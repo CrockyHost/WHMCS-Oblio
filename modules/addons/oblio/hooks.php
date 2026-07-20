@@ -685,8 +685,9 @@ function oblio_handle_late_fee_amendment($invoiceId, array $settings)
         //    balance instead of the full amount.
         $newInvoiceId = WhmcsHelper::createReplacementInvoice($invoiceId, 7, !$hasPayments);
 
-        // 2. Record the link immediately so EmailPreSend can suppress the original's
-        //    overdue/modified emails that fire later in this same cron pass.
+        // 2. Record the old -> new link. Marks the amendment complete (isAmended guard) and
+        //    lets EmailPreSend keep suppressing the original's dunning emails for a short
+        //    window after the replacement is issued.
         WhmcsHelper::logAmendment($invoiceId, $newInvoiceId);
 
         // 3. Sync the replacement to Oblio before moving any payments onto it, so the
@@ -741,31 +742,84 @@ function oblio_handle_late_fee_amendment($invoiceId, array $settings)
 /**
  * Hook: AddInvoiceLateFee
  *
- * Fires after WHMCS adds a late fee line item to an overdue invoice. If late-fee amendment
- * is enabled, we storno-and-reissue instead of leaving the original fiscally edited.
+ * Fires when WHMCS adds a late fee to an overdue invoice - but BEFORE the fee line item is
+ * actually written (confirmed from the cron activity log: the "Late Invoice Fees added"
+ * entry lands after this hook returns). Snapshotting the invoice here therefore misses the
+ * fee. So we only QUEUE the invoice for amendment; the real storno+reissue runs in
+ * DailyCronJob, by which point the fee is committed and the snapshot is complete.
+ *
+ * Writing the pending marker now also arms EmailPreSend to suppress the original's dunning
+ * emails for the rest of this cron run (the original stays Unpaid until DailyCronJob).
  */
 add_hook('AddInvoiceLateFee', 1, function ($vars) {
     if (empty($vars['invoiceid'])) {
         return;
     }
+    $invoiceId = (int)$vars['invoiceid'];
+
     $settings = oblio_get_module_settings();
     if (empty($settings['enable_late_fee_amendment']) || $settings['enable_late_fee_amendment'] !== 'on') {
         return;
     }
-    oblio_handle_late_fee_amendment((int)$vars['invoiceid'], $settings);
+    // Cheap pre-checks so we only mark (and later suppress emails for) real candidates.
+    if (empty($settings['enable_storno']) || $settings['enable_storno'] !== 'on') {
+        return;
+    }
+    if (!WhmcsHelper::getSyncedInvoice($invoiceId) || WhmcsHelper::isAmended($invoiceId)) {
+        return;
+    }
+
+    WhmcsHelper::logPendingAmendment($invoiceId);
+    logActivity('Oblio: Late fee on invoice #' . $invoiceId . ' - queued for storno+reissue at end of cron (fee not yet committed at hook time).');
+});
+
+/**
+ * Hook: DailyCronJob
+ *
+ * Runs at the very end of the daily automation, after late fees are committed and reminder
+ * emails have been sent. Processes every invoice queued by AddInvoiceLateFee: now the fee
+ * line item exists, so oblio_handle_late_fee_amendment() snapshots it correctly.
+ */
+add_hook('DailyCronJob', 1, function () {
+    $settings = oblio_get_module_settings();
+    if (empty($settings['enable_late_fee_amendment']) || $settings['enable_late_fee_amendment'] !== 'on') {
+        return;
+    }
+
+    $pending = WhmcsHelper::getPendingAmendmentInvoiceIds();
+    foreach ($pending as $invoiceId) {
+        $result = oblio_handle_late_fee_amendment($invoiceId, $settings);
+
+        if (!empty($result['success'])) {
+            WhmcsHelper::clearPendingAmendment($invoiceId);
+            continue;
+        }
+
+        // Amendment didn't complete. Only keep the marker (for a retry on the next cron) if
+        // the invoice is still open and worth amending; otherwise drop it so we don't retry
+        // or suppress its emails forever.
+        $invoice = WhmcsHelper::getInvoice($invoiceId);
+        $status  = $invoice['status'] ?? '';
+        if (empty($invoice) || !in_array($status, ['Unpaid', 'Collections'], true) || WhmcsHelper::isAmended($invoiceId)) {
+            WhmcsHelper::clearPendingAmendment($invoiceId);
+        } else {
+            logActivity('Oblio: Late fee amendment for invoice #' . $invoiceId . ' did not complete; will retry next cron. Reason: ' . ($result['message'] ?? 'unknown'));
+        }
+    }
 });
 
 /**
  * Hook: EmailPreSend
  *
- * Suppresses the emails WHMCS would otherwise send about an invoice we just stornoed and
- * replaced via the late-fee amendment flow:
+ * Suppresses the emails WHMCS would otherwise send about an invoice that is queued for, or has
+ * just undergone, the late-fee storno+reissue:
  *
  *   - "Invoice Modified" for any Oblio-synced invoice: an issued fiscal invoice must never
  *     be edited in place, so this email is always misleading for synced invoices. Aborting
- *     it is order-independent (works even if WHMCS sends it before AddInvoiceLateFee fires).
- *   - Overdue notices / payment reminders for an invoice amended in the last few minutes:
- *     the original is now cancelled and replaced, so its dunning emails are stale.
+ *     it is order-independent.
+ *   - Overdue notices / payment reminders for an invoice that is pending amendment (its
+ *     replacement hasn't been issued yet this cron) or was amended in the last few minutes:
+ *     the original is being replaced, so its dunning emails are stale.
  *
  * Only active when late-fee amendment is enabled.
  */
@@ -787,11 +841,11 @@ add_hook('EmailPreSend', 1, function ($vars) {
         return ['abortsend' => true];
     }
 
-    // Rule B: suppress dunning emails for a freshly amended (stornoed + replaced) invoice.
+    // Rule B: suppress dunning emails for an invoice pending amendment or freshly amended.
     $isDunning = stripos($messagename, 'Overdue') !== false
         || stripos($messagename, 'Reminder') !== false;
-    if ($isDunning && WhmcsHelper::wasRecentlyAmended($relid, 600)) {
-        logActivity('Oblio: Suppressed "' . $messagename . '" email for invoice #' . $relid . ' (stornoed and replaced by late-fee amendment).');
+    if ($isDunning && (WhmcsHelper::hasPendingAmendment($relid) || WhmcsHelper::wasRecentlyAmended($relid, 600))) {
+        logActivity('Oblio: Suppressed "' . $messagename . '" email for invoice #' . $relid . ' (queued for / undergoing late-fee storno+reissue).');
         return ['abortsend' => true];
     }
 });

@@ -932,4 +932,102 @@ class WhmcsHelper
         }
         return false;
     }
+
+    /**
+     * Queue an invoice for late-fee storno+reissue at the end of the cron run.
+     *
+     * WHMCS fires AddInvoiceLateFee BEFORE it writes the late-fee line item, so the amendment
+     * can't be done inline (the snapshot would miss the fee). Instead we mark the invoice
+     * 'amend_pending' here and run the real amendment from the DailyCronJob hook, by which
+     * point the fee is committed. Writing this marker early also arms EmailPreSend to suppress
+     * the original's dunning emails for the rest of the cron run.
+     *
+     * @param int $invoiceId
+     */
+    public static function logPendingAmendment($invoiceId)
+    {
+        // Don't stack duplicate markers if the hook somehow fires twice for one invoice.
+        if (self::hasPendingAmendment($invoiceId)) {
+            return;
+        }
+        self::logSync($invoiceId, 'amend_pending', '', '', 'success', 'Queued for late-fee storno+reissue after cron.', null);
+    }
+
+    /**
+     * Is there an outstanding late-fee amendment marker for this invoice within $windowSeconds?
+     * Defaults to a 2-day window so a marker left behind by an interrupted cron still suppresses
+     * dunning emails until the next DailyCronJob processes it, but a very old stray marker stops
+     * silencing the invoice forever.
+     *
+     * @param int $invoiceId
+     * @param int $windowSeconds
+     * @return bool
+     */
+    public static function hasPendingAmendment($invoiceId, $windowSeconds = 172800)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                $cutoff = date('Y-m-d H:i:s', strtotime('-' . (int)$windowSeconds . ' seconds'));
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'amend_pending')
+                    ->where('status', 'success')
+                    ->where('created_at', '>=', $cutoff)
+                    ->exists();
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return false;
+    }
+
+    /**
+     * Distinct invoice IDs still awaiting a late-fee amendment: they have an 'amend_pending'
+     * marker (within the last 7 days) but no completed 'amended' row yet. Used by DailyCronJob.
+     *
+     * @return int[]
+     */
+    public static function getPendingAmendmentInvoiceIds()
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                $cutoff = date('Y-m-d H:i:s', strtotime('-7 days'));
+                $pending = \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('oblio_type', 'amend_pending')
+                    ->where('status', 'success')
+                    ->where('created_at', '>=', $cutoff)
+                    ->distinct()
+                    ->pluck('invoice_id')
+                    ->toArray();
+
+                return array_values(array_filter(array_map('intval', $pending), function ($id) {
+                    return !self::isAmended($id);
+                }));
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return [];
+    }
+
+    /**
+     * Remove the pending-amendment marker(s) for an invoice once it has been processed.
+     *
+     * @param int $invoiceId
+     * @return int Rows deleted
+     */
+    public static function clearPendingAmendment($invoiceId)
+    {
+        try {
+            if (class_exists('\\WHMCS\\Database\\Capsule')) {
+                return \WHMCS\Database\Capsule::table('mod_oblio_invoices')
+                    ->where('invoice_id', $invoiceId)
+                    ->where('oblio_type', 'amend_pending')
+                    ->delete();
+            }
+        } catch (\Exception $e) {
+            // Fall through
+        }
+        return 0;
+    }
 }

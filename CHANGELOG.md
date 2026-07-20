@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.3 - Fix: late-fee reissue produced a fee-less copy (defer to end of cron) (2026-07-20)
+
+**Bug:** `AddInvoiceLateFee` fires *before* WHMCS writes the late-fee line item to the invoice (confirmed from the cron activity log: the "Late Invoice Fees added" entry lands after the hook returns). The amendment ran synchronously inside that hook, so its `GetInvoice` snapshot never saw the fee. The result was a storno of the original plus a replacement invoice identical to it, with no late fee anywhere - the fee silently vanished.
+
+**Fix:** the amendment is now deferred.
+
+- `AddInvoiceLateFee` no longer reissues inline. It writes an `amend_pending` marker (new `oblio_type`) after cheap eligibility checks, and returns. Writing the marker early also arms email suppression for the rest of the cron run.
+- A new `DailyCronJob` hook runs the real storno+reissue for every pending invoice at the end of the daily automation, when the late-fee line item is committed. The snapshot now includes the fee.
+- `EmailPreSend` also suppresses overdue notices / reminders for invoices that are *pending* amendment (the original stays Unpaid until `DailyCronJob` cancels it), not only freshly amended ones.
+- Pending markers are cleared once processed, retried on the next cron if the amendment could not complete while the invoice is still open, and dropped if the invoice is no longer open.
+
+The manual "Storno + Reissue" admin button is unaffected - it always runs after the fee is committed, so it already snapshotted correctly.
+
+No schema change (the `amend_pending` marker reuses `mod_oblio_invoices`). No action needed for invoices already mis-amended before upgrading; only new late fees use the corrected flow.
+
 ## 1.5.2 - Correct replacement-invoice email when the original was partially paid (2026-06-13)
 
 - When a late-fee amendment runs on an invoice that already had a partial payment, the replacement's "Invoice Created" email is now deferred until after the payment has been moved across, so the customer sees the real remaining balance instead of the full amount. Fully-unpaid invoices (the common case) are unchanged - their email still goes out at creation.
